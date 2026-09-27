@@ -24,7 +24,15 @@ Index file formats supported:
     [b"TIBIDX03"][u64 tib_size][u64 data_start][u64 data_end][u64 block_count]
     [u32 clusters_per_block][u32 preamble_len][u64 reserved_flags]
     block_count × {u64 file_offset, preamble_len-byte preamble, u32 comp_len}
+
+  TIBIDX04 (one partition of a multi-partition and/or multi-slice archive):
+    TIBIDX03 header, then [u32 n_slices] and per slice
+    {u64 concat_start, u64 concat_len, u16 name_len, name (utf-8 basename,
+    resolved next to the .tib)}, then block_count × {u64 voff, u32 comp_len}.
+    voff = 32 + concat offset; preambles are read lazily from the archive.
 """
+import bisect
+import os
 import struct
 import zlib
 import threading
@@ -41,6 +49,7 @@ BLOCK_SIZE = CLUSTER_SIZE * CLUSTERS_PER_BLOCK  # 524288
 
 INDEX_MAGIC = b"TIBIDX02"        # modern, fixed 16B preamble + 128 cpb
 INDEX_MAGIC_V3 = b"TIBIDX03"     # explicit geometry; supports legacy too
+INDEX_MAGIC_V4 = b"TIBIDX04"     # multi-slice chain, lazy preambles
 INDEX_REC_SIZE = 28  # u64 file_offset, 16 bytes preamble, u32 comp_len (TIBIDX02)
 
 
@@ -70,9 +79,32 @@ class TibReader:
 
     def __init__(self, tib_path: str, index_path: str, cache_blocks: int = 128):
         self.tib_path = tib_path
+        self._lazy = False
+        # (voff_start, voff_end, voff - file_offset, path)
+        self._slices = [(0, 1 << 64, 0, tib_path)]
         with open(index_path, "rb") as f:
             magic = f.read(8)
-            if magic == INDEX_MAGIC:
+            if magic == INDEX_MAGIC_V4:
+                self.tib_size, self.data_start, self.data_end, self.block_count = \
+                    struct.unpack("<QQQQ", f.read(32))
+                cpb, plen, _flags = struct.unpack("<IIQ", f.read(16))
+                self.clusters_per_block = cpb
+                self.preamble_len = plen
+                base = os.path.dirname(os.path.abspath(tib_path))
+                (n_slices,) = struct.unpack("<I", f.read(4))
+                self._slices = []
+                for _ in range(n_slices):
+                    start, length, nlen = struct.unpack("<QQH", f.read(18))
+                    name = f.read(nlen).decode("utf-8")
+                    self._slices.append((VOLUME_HEADER_LEN + start,
+                                         VOLUME_HEADER_LEN + start + length,
+                                         start, os.path.join(base, name)))
+                self._lazy = True
+                self._rec_size = 12
+                self.records_blob = f.read(self.block_count * self._rec_size)
+                self._preambles = bytearray(self.block_count * plen)
+                self._pre_loaded = bytearray(self.block_count)
+            elif magic == INDEX_MAGIC:
                 # TIBIDX02 — modern only.
                 self.tib_size, self.data_start, self.data_end, self.block_count = \
                     struct.unpack("<QQQQ", f.read(32))
@@ -101,18 +133,36 @@ class TibReader:
         self.cache = LRUCache(cache_blocks)
         # Pre-build a struct format string for record decoding.
         self._rec_fmt = f"<Q{self.preamble_len}sI"
+        self._slice_starts = [s[0] for s in self._slices]
 
-    def _file(self):
-        if not hasattr(self._tls, "f"):
-            self._tls.f = open(self.tib_path, "rb")
-        return self._tls.f
+    def _read_at(self, voff: int, length: int) -> bytes:
+        """Read from the (possibly multi-slice) archive at a virtual offset."""
+        k = bisect.bisect_right(self._slice_starts, voff) - 1
+        if k < 0 or voff + length > self._slices[k][1]:
+            raise ValueError(f"offset {voff}+{length} outside the archive slices")
+        files = getattr(self._tls, "files", None)
+        if files is None:
+            files = self._tls.files = {}
+        f = files.get(k)
+        if f is None:
+            f = files[k] = open(self._slices[k][3], "rb")
+        f.seek(voff - self._slices[k][2])
+        return f.read(length)
 
     def _get_record(self, block_idx: int):
         """Returns (file_offset, preamble_bytes, comp_len) for block block_idx."""
         if block_idx < 0 or block_idx >= self.block_count:
             raise IndexError(f"block {block_idx} out of range [0, {self.block_count})")
         off = block_idx * self._rec_size
-        return struct.unpack_from(self._rec_fmt, self.records_blob, off)
+        if not self._lazy:
+            return struct.unpack_from(self._rec_fmt, self.records_blob, off)
+        voff, comp_len = struct.unpack_from("<QI", self.records_blob, off)
+        plen = self.preamble_len
+        p0 = block_idx * plen
+        if comp_len and not self._pre_loaded[block_idx]:
+            self._preambles[p0:p0 + plen] = self._read_at(voff, plen)
+            self._pre_loaded[block_idx] = 1
+        return voff, bytes(self._preambles[p0:p0 + plen]), comp_len
 
     def _decompress_block(self, block_idx: int) -> bytes:
         """Returns the full decompressed block (only present clusters concatenated)."""
@@ -125,11 +175,16 @@ class TibReader:
                 f"corrupt index: block {block_idx} comp_len={comp_len} "
                 f"< preamble_len={self.preamble_len}"
             )
-        f = self._file()
-        f.seek(file_off + self.preamble_len)
-        comp_data = f.read(comp_len - self.preamble_len)
+        comp_data = self._read_at(file_off + self.preamble_len, comp_len - self.preamble_len)
         decomp = zlib.decompressobj()
         out = decomp.decompress(comp_data)
+        if self._lazy:
+            expected = sum(bin(b).count("1") for b in preamble) * CLUSTER_SIZE
+            if len(out) != expected:
+                raise IOError(
+                    f"block {block_idx} at offset {file_off}: decompressed "
+                    f"{len(out)} bytes, bitmap says {expected}"
+                )
         # Trust trail-bytes; nothing more to do
         self.cache.put(block_idx, out)
         return out
@@ -221,7 +276,7 @@ def cmd_info(idx_path: str):
     with open(idx_path, "rb") as f:
         magic = f.read(8)
         tib_size, data_start, data_end, block_count = struct.unpack("<QQQQ", f.read(32))
-        if magic == INDEX_MAGIC_V3:
+        if magic in (INDEX_MAGIC_V3, INDEX_MAGIC_V4):
             cpb, plen, _flags = struct.unpack("<IIQ", f.read(16))
         elif magic == INDEX_MAGIC:
             cpb, plen = CLUSTERS_PER_BLOCK, PREAMBLE_LEN

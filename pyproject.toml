@@ -34,6 +34,9 @@ fuse = ["fusepy>=3.0"]
 winfsp = ["winfspy>=0.8"]
 fast = ["numpy>=1.20"]
 
+[tool.uv.extra-build-dependencies]
+winfspy = ["future"]
+
 [project.scripts]
 tib = "tibread.cli:main"
 

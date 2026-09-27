@@ -136,6 +136,8 @@ class _NtfsFS(Operations if FUSE else object):
             raise FuseOSError(errno.ENOENT)
         result = [".", ".."]
         for e in entries:
+            if e.name in (".", ".."):
+                continue
             if e.name and "\x00" not in e.name:
                 # FUSE forbids '/' in names — replace defensively
                 result.append(e.name.replace("/", "_"))
@@ -222,15 +224,15 @@ def _open_tibx_volume(tibx_path: str, partition: int):
 
 
 def fuse_mount(tib_path: str, mountpoint: str, *, foreground: bool = False,
-               cache_blocks: int = 128, partition: int = 1) -> int:
+               cache_blocks: int = 128, partition: int | None = None) -> int:
     """Mount the backup's NTFS volume at *mountpoint*. Returns 0 on success.
 
     Routes to the appropriate adapter based on the input file:
 
     * ``.tib`` (sector-mode): handled by :func:`tibread.indexer.open_tib`,
       which builds (or reuses) the partition-direct ``.idx`` sidecar.
-      The ``partition`` argument is ignored — sector-mode `.tib` carries
-      a single partition.
+      ``partition`` is the 1-based number from ``tib partitions``; it is
+      required for multi-partition archives and ignored otherwise.
 
     * ``.tibx`` (QARCH archive3): handled by
       :class:`tibread.tibx.TibxDiskAdapter` + :class:`NtfsVolume`.  The
@@ -248,7 +250,7 @@ def fuse_mount(tib_path: str, mountpoint: str, *, foreground: bool = False,
 
     adapter = None
     if is_tibx_file(tib_path):
-        vol, adapter = _open_tibx_volume(tib_path, partition)
+        vol, adapter = _open_tibx_volume(tib_path, 1 if partition is None else partition)
         total = getattr(vol, "total_files", None)
         if total:
             print(f"[tibread] {total:,} files indexed; mounting at {mountpoint}")
@@ -256,7 +258,8 @@ def fuse_mount(tib_path: str, mountpoint: str, *, foreground: bool = False,
             print(f"[tibread] mounting at {mountpoint}")
     else:
         print(f"[tibread] opening {tib_path} as sector-mode .tib...")
-        vol = open_tib(tib_path, cache_blocks=cache_blocks, progress=True)
+        vol = open_tib(tib_path, cache_blocks=cache_blocks, progress=True,
+                       partition=partition)
         print(f"[tibread] {vol.total_files:,} files indexed; mounting at {mountpoint}")
 
     try:

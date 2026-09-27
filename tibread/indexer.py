@@ -34,6 +34,7 @@ import os
 import struct
 from pathlib import Path
 from typing import Optional
+from zlib import error as zlib_error
 
 from .chunkmap_locator import discover_chunkmap_offset, detect_format_era
 from .chunkmap import decode_chunk_map
@@ -45,6 +46,7 @@ from .reader import (
     TibReader,
     INDEX_MAGIC,
     INDEX_MAGIC_V3,
+    INDEX_MAGIC_V4,
     VOLUME_HEADER_LEN,
 )
 
@@ -54,22 +56,118 @@ def _default_index_path(tib_path: str | os.PathLike) -> Path:
     return Path(tib_path).with_suffix(Path(tib_path).suffix + ".idx")
 
 
+def partition_index_path(tib_path: str | os.PathLike, partition: int) -> Path:
+    """Per-partition indexes go in the user cache dir so the backup media
+    is never written to."""
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "tibread"
+    size = os.path.getsize(tib_path)
+    return cache / f"{Path(tib_path).name}.{size}.p{partition}.idx"
+
+
+def _multi_partition_default(tib_path: str | os.PathLike) -> Optional[int]:
+    """For archives the single-partition path can't handle (several
+    partitions, or an incremental slice), return the partition to use or
+    raise asking the user to choose. Returns None for everything else."""
+    from .partitions import list_partitions, format_partition_table
+    from .chunkmap_locator import UnsupportedTibFormat
+    try:
+        chain, parts = list_partitions(str(tib_path))
+    except (UnsupportedTibFormat, ValueError, IndexError, struct.error, OSError, zlib_error):
+        return None
+    if not parts or (len(chain) == 1 and len(parts) == 1):
+        return None
+    if len(parts) == 1:
+        return 1
+    raise UnsupportedTibFormat(
+        f"{Path(tib_path).name} contains {len(parts)} partitions; choose one "
+        f"with --partition N:\n{format_partition_table(chain, parts)}"
+    )
+
+
+def build_partition_index(
+    tib_path: str | os.PathLike,
+    partition: int,
+    index_path: Optional[str | os.PathLike] = None,
+    *,
+    force: bool = False,
+    progress: bool = False,
+) -> Path:
+    """Build (or reuse) a TIBIDX04 index for one partition of a
+    multi-partition and/or incremental-chain sector-mode archive."""
+    from .partitions import list_partitions, decode_partition_chunkmap, format_partition_table
+    from .chunkmap_locator import UnsupportedTibFormat
+
+    tib_path = Path(tib_path)
+    index_path = Path(index_path) if index_path else partition_index_path(tib_path, partition)
+    if index_path.exists() and not force:
+        return index_path
+
+    chain, parts = list_partitions(str(tib_path))
+    match = [p for p in parts if p.number == partition]
+    if not match:
+        raise UnsupportedTibFormat(
+            f"no partition {partition} in {tib_path.name}:\n"
+            f"{format_partition_table(chain, parts)}"
+        )
+    part = match[0]
+    if progress:
+        print(
+            f"[tibread] partition {part.number}: {part.label or '(no label)'} "
+            f"{part.size_bytes / 1024**3:.1f} GiB, {len(chain)} slice(s); "
+            f"decoding chunk map...",
+            flush=True,
+        )
+    records, cpb = decode_partition_chunkmap(chain, part)
+    if progress:
+        n_stored = sum(1 for _, ln in records if ln > 0)
+        print(f"[tibread]   {len(records):,} blocks ({n_stored:,} stored)", flush=True)
+
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = index_path.with_suffix(index_path.suffix + ".tmp")
+    rec = struct.Struct("<QI")
+    with open(tmp, "wb") as out:
+        out.write(INDEX_MAGIC_V4)
+        out.write(struct.pack("<QQQQ", tib_path.stat().st_size, VOLUME_HEADER_LEN, 0, len(records)))
+        out.write(struct.pack("<IIQ", cpb, cpb // 8, 0))
+        out.write(struct.pack("<I", len(chain)))
+        for s in chain:
+            name = os.path.basename(s.path).encode("utf-8")
+            out.write(struct.pack("<QQH", s.concat_start, s.concat_len, len(name)) + name)
+        out.write(b"".join(
+            rec.pack(off + VOLUME_HEADER_LEN if ln else 0, ln) for off, ln in records
+        ))
+    os.replace(tmp, index_path)
+    if progress:
+        print(f"[tibread] index written → {index_path}", flush=True)
+    return index_path
+
+
 def build_index(
     tib_path: str | os.PathLike,
     index_path: Optional[str | os.PathLike] = None,
     *,
     force: bool = False,
     progress: bool = False,
+    partition: Optional[int] = None,
 ) -> Path:
     """Build (or reuse) a partition-direct index for a sector-mode `.tib`.
 
     Returns the index path. Idempotent: if the index already exists and
     `force` is False, the existing file is returned untouched.
 
+    `partition` (1-based) selects one partition of a multi-partition or
+    incremental-chain archive (see `tib partitions`).
+
     Raises ValueError if the `.tib` is not sector-mode (e.g. filesystem-mode
     `.tib` files use a different magic and aren't supported by this reader).
     """
     tib_path = Path(tib_path)
+    if partition is None:
+        partition = _multi_partition_default(tib_path)
+    if partition is not None:
+        return build_partition_index(
+            tib_path, partition, index_path, force=force, progress=progress
+        )
     if index_path is None:
         index_path = _default_index_path(tib_path)
     index_path = Path(index_path)
@@ -292,15 +390,17 @@ def open_tib(
     cache_blocks: int = 32,
     build_ntfs_index: bool = True,
     progress: bool = False,
+    partition: Optional[int] = None,
 ):
     """High-level entry point: open a `.tib`, build/load index, return NtfsVolume.
 
     The index is auto-cached next to the `.tib` as `<tib>.idx` unless an
-    explicit `index_path` is given.
+    explicit `index_path` is given. Multi-partition / incremental archives
+    need `partition` (1-based) and cache their index under ~/.cache/tibread.
     """
     from .ntfs import NtfsVolume  # imported lazily to avoid cycles
 
-    idx = build_index(tib_path, index_path, progress=progress)
+    idx = build_index(tib_path, index_path, progress=progress, partition=partition)
     reader = TibReader(str(tib_path), str(idx), cache_blocks=cache_blocks)
     mft_lcn = NtfsVolume.find_mft_lcn(reader)
     vol = NtfsVolume(

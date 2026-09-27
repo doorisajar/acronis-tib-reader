@@ -31,9 +31,34 @@ from . import __version__
 from .reader import TibReader
 from .indexer import build_index, open_tib
 
+PARTITION_HELP = (
+    "Partition number (1-based, see `tib partitions`) for multi-partition "
+    "or incremental-chain archives."
+)
+
+
+def _multi_partition_listing(tib):
+    """(chain, parts) for multi-partition / incremental archives, else None."""
+    from .partitions import list_partitions
+    try:
+        chain, parts = list_partitions(str(tib))
+    except Exception:
+        return None
+    if parts and (len(chain) > 1 or len(parts) > 1):
+        return chain, parts
+    return None
+
+
+def cmd_partitions(args):
+    from .partitions import list_partitions, format_partition_table
+    chain, parts = list_partitions(args.tib)
+    print(format_partition_table(chain, parts))
+    return 0
+
 
 def cmd_info(args):
     from .chunkmap_locator import discover_chunkmap_offset, detect_format_era
+    from .partitions import format_partition_table
     from .verify import compute_header_adler32
 
     tib = Path(args.tib)
@@ -43,18 +68,26 @@ def cmd_info(args):
     # and unknown magics; detect_format_era covers very-legacy.
     ok, stored, computed = compute_header_adler32(str(tib))
     print(f"tib file: {tib}  ({tib.stat().st_size:,} bytes)")
-    era = detect_format_era(str(tib))
-    print(f"  format era: {era}")
-    if era == "modern":
-        chunkmap_off, chunkmap_size = discover_chunkmap_offset(str(tib))
-        print(f"  chunk-map: offset={chunkmap_off:,}  comp_size={chunkmap_size:,}")
+    multi = _multi_partition_listing(tib)
+    if multi:
+        print("  format: multi-partition / incremental chain")
+        print("  " + format_partition_table(*multi).replace("\n", "\n  "))
     else:
-        print(f"  chunk-map: inline (multiple SequentialChunkMap records "
-              f"interleaved with the block stream)")
+        era = detect_format_era(str(tib))
+        print(f"  format era: {era}")
+        if era == "modern":
+            chunkmap_off, chunkmap_size = discover_chunkmap_offset(str(tib))
+            print(f"  chunk-map: offset={chunkmap_off:,}  comp_size={chunkmap_size:,}")
+        else:
+            print(f"  chunk-map: inline (multiple SequentialChunkMap records "
+                  f"interleaved with the block stream)")
     print(f"  header Adler32: stored={stored:08X} computed={computed:08X} {'OK' if ok else 'MISMATCH'}")
+    if multi and args.partition is None:
+        print("  (pass --partition N for per-partition details)")
+        return 0
 
     # Build (or load) index, then show partition stats
-    idx_path = build_index(tib, progress=args.verbose)
+    idx_path = build_index(tib, progress=args.verbose, partition=args.partition)
     r = TibReader(str(tib), str(idx_path), cache_blocks=4)
     if r.partition_size >= 1024 ** 4:
         size_str = f"{r.partition_size / 1024**4:.2f} TiB"
@@ -79,7 +112,8 @@ def cmd_info(args):
 
 
 def cmd_index(args):
-    out = build_index(args.tib, args.out, force=args.force, progress=True)
+    out = build_index(args.tib, args.out, force=args.force, progress=True,
+                      partition=args.partition)
     print(f"index written: {out}")
     return 0
 
@@ -92,7 +126,7 @@ def cmd_verify(args):
 
 
 def cmd_ls(args):
-    vol = open_tib(args.tib, progress=args.verbose)
+    vol = open_tib(args.tib, progress=args.verbose, partition=args.partition)
     path = args.path or "/"
     for fe in vol.list_dir(path):
         kind = "d" if fe.is_dir else "-"
@@ -102,7 +136,7 @@ def cmd_ls(args):
 
 
 def cmd_extract(args):
-    vol = open_tib(args.tib, progress=args.verbose)
+    vol = open_tib(args.tib, progress=args.verbose, partition=args.partition)
     out = Path(args.out) if args.out else Path(args.path.replace("\\", "/")).name
     data = vol.read_file(args.path)
     out.write_bytes(data)
@@ -797,16 +831,19 @@ def cmd_tibx_chain(args):
 
 def cmd_mount(args):
     try:
-        from .mount.fuse import fuse_mount
+        from .mount.fuse import fuse_mount, is_tibx_file
     except ImportError as e:
         print(f"FUSE mount unavailable: {e}", file=sys.stderr)
         print("Install with: pip install fusepy", file=sys.stderr)
         return 1
+    partition = args.partition
+    if partition is None and is_tibx_file(args.tib):
+        partition = 1
     return fuse_mount(
         args.tib,
         args.mountpoint,
         foreground=args.foreground,
-        partition=args.partition,
+        partition=partition,
     )
 
 
@@ -822,12 +859,21 @@ def main(argv=None):
     ap = sub.add_parser("info", help="Show .tib structure summary.")
     ap.add_argument("tib")
     ap.add_argument("--ntfs", action="store_true", help="Also probe NTFS MFT.")
+    ap.add_argument("--partition", type=int, default=None, help=PARTITION_HELP)
     ap.set_defaults(func=cmd_info)
+
+    ap = sub.add_parser(
+        "partitions",
+        help="List the partitions (and incremental slices) in a sector-mode .tib.",
+    )
+    ap.add_argument("tib")
+    ap.set_defaults(func=cmd_partitions)
 
     ap = sub.add_parser("index", help="Build the partition-direct index.")
     ap.add_argument("tib")
     ap.add_argument("--out", help="Output path (default: <tib>.idx).")
     ap.add_argument("--force", action="store_true", help="Rebuild even if cached.")
+    ap.add_argument("--partition", type=int, default=None, help=PARTITION_HELP)
     ap.set_defaults(func=cmd_index)
 
     ap = sub.add_parser("verify", help="Validate volume-header Adler32.")
@@ -837,12 +883,14 @@ def main(argv=None):
     ap = sub.add_parser("ls", help="List files in the .tib's filesystem.")
     ap.add_argument("tib")
     ap.add_argument("path", nargs="?", default="")
+    ap.add_argument("--partition", type=int, default=None, help=PARTITION_HELP)
     ap.set_defaults(func=cmd_ls)
 
     ap = sub.add_parser("extract", help="Extract a single file.")
     ap.add_argument("tib")
     ap.add_argument("path", help="Path within the .tib's filesystem.")
     ap.add_argument("-o", "--out", help="Output path (default: basename of source).")
+    ap.add_argument("--partition", type=int, default=None, help=PARTITION_HELP)
     ap.set_defaults(func=cmd_extract)
 
     ap = sub.add_parser(
@@ -980,11 +1028,11 @@ def main(argv=None):
     ap.add_argument(
         "--partition",
         type=int,
-        default=1,
-        help="MBR partition index to mount (0-based). Only used for "
-             ".tibx; ignored for sector-mode .tib (single partition). "
-             "Default: 1 (typically the main system partition; "
-             "partition 0 is usually 'System Reserved').",
+        default=None,
+        help="Partition to mount. For .tibx: MBR partition index "
+             "(0-based, default 1; partition 0 is usually 'System "
+             "Reserved'). For multi-partition / incremental .tib: the "
+             "1-based number shown by `tib partitions`.",
     )
     ap.set_defaults(func=cmd_mount)
 
